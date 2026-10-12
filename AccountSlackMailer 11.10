@@ -1,0 +1,547 @@
+const SETTINGS = {
+  REQUESTS_SHEET: 'ответы из вф',
+  CONFIG_SHEET: 'Конфигурация'
+};
+
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Slack рассылка')
+    .addItem(
+      'Отправить выбранную заявку',
+      'sendSelectedRequest'
+    )
+    .addToUi();
+}
+
+
+function prepareRequests() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const requestsSheet = ss.getSheetByName(SETTINGS.REQUESTS_SHEET);
+  const configSheet = ss.getSheetByName(SETTINGS.CONFIG_SHEET);
+
+  if (!requestsSheet) {
+    throw new Error(
+      `Не найден лист "${SETTINGS.REQUESTS_SHEET}"`
+    );
+  }
+
+  if (!configSheet) {
+    throw new Error(
+      `Не найден лист "${SETTINGS.CONFIG_SHEET}"`
+    );
+  }
+
+  // -------------------------------
+  // 1. Читаем конфигурацию авиакомпаний
+  // -------------------------------
+
+  const configLastRow = configSheet.getLastRow();
+
+  if (configLastRow < 2) {
+    throw new Error(
+      'Лист "Конфигурация" пуст. Добавь авиакомпании и тексты сообщений.'
+    );
+  }
+
+  const configData = configSheet
+    .getRange(2, 1, configLastRow - 1, 2)
+    .getValues();
+
+  const messagesByAirline = {};
+
+  configData.forEach(row => {
+    const airline = String(row[0]).trim();
+    const message = String(row[1]).trim();
+
+    if (airline && message) {
+      messagesByAirline[airline.toLowerCase()] = message;
+    }
+  });
+
+
+  // -------------------------------
+  // 2. Добавляем служебные колонки
+  // -------------------------------
+
+  let headers = requestsSheet
+    .getRange(1, 1, 1, requestsSheet.getLastColumn())
+    .getValues()[0];
+
+  const requiredColumns = [
+    'Получателей',
+    'Текст сообщения',
+    'Статус'
+  ];
+
+  requiredColumns.forEach(columnName => {
+    if (!headers.includes(columnName)) {
+      requestsSheet
+        .getRange(1, requestsSheet.getLastColumn() + 1)
+        .setValue(columnName);
+
+      headers.push(columnName);
+    }
+  });
+
+
+  // -------------------------------
+  // 3. Находим нужные колонки
+  // -------------------------------
+
+  const airlineColumn =
+    headers.indexOf('Авиакомпания') + 1;
+
+  const emailColumn =
+    headers.indexOf('Email') + 1;
+
+  const recipientsColumn =
+    headers.indexOf('Получателей') + 1;
+
+  const messageColumn =
+    headers.indexOf('Текст сообщения') + 1;
+
+  const statusColumn =
+    headers.indexOf('Статус') + 1;
+
+  if (!airlineColumn || !emailColumn) {
+    throw new Error(
+      'В листе заявок должны быть колонки "Авиакомпания" и "Email".'
+    );
+  }
+
+
+  // -------------------------------
+  // 4. Обрабатываем заявки
+  // -------------------------------
+
+  const lastRow = requestsSheet.getLastRow();
+
+  if (lastRow < 2) {
+    SpreadsheetApp.getUi().alert(
+      'Пока нет заявок.'
+    );
+    return;
+  }
+
+  const data = requestsSheet
+    .getRange(
+      2,
+      1,
+      lastRow - 1,
+      requestsSheet.getLastColumn()
+    )
+    .getValues();
+
+
+  data.forEach((row, index) => {
+
+    const sheetRow = index + 2;
+
+    const airline =
+      String(row[airlineColumn - 1]).trim();
+
+    const emailsRaw =
+      String(row[emailColumn - 1]).trim();
+
+    // Пустую строку пропускаем
+    if (!airline && !emailsRaw) {
+      return;
+    }
+
+
+    // -------------------------------
+    // Разбираем список email
+    // -------------------------------
+
+    const emails = emailsRaw
+      .split(/[\n,;]+/)
+      .map(email => email.trim())
+      .filter(email => email !== '');
+
+
+    // Убираем дубликаты
+    const uniqueEmails =
+      [...new Set(emails)];
+
+
+    // -------------------------------
+    // Ищем текст для авиакомпании
+    // -------------------------------
+
+    const message =
+      messagesByAirline[airline.toLowerCase()];
+
+
+    if (!message) {
+
+      requestsSheet
+        .getRange(sheetRow, recipientsColumn)
+        .setValue(uniqueEmails.length);
+
+      requestsSheet
+        .getRange(sheetRow, messageColumn)
+        .setValue('');
+
+      requestsSheet
+        .getRange(sheetRow, statusColumn)
+        .setValue(
+          `❌ Не найден текст для авиакомпании "${airline}"`
+        );
+
+      return;
+    }
+
+
+    if (uniqueEmails.length === 0) {
+
+      requestsSheet
+        .getRange(sheetRow, statusColumn)
+        .setValue('❌ Нет email');
+
+      return;
+    }
+
+
+    // -------------------------------
+    // Всё хорошо
+    // -------------------------------
+
+    requestsSheet
+      .getRange(sheetRow, recipientsColumn)
+      .setValue(uniqueEmails.length);
+
+    requestsSheet
+      .getRange(sheetRow, messageColumn)
+      .setValue(message)
+      .setWrap(true);
+
+    requestsSheet
+      .getRange(sheetRow, statusColumn)
+      .setValue('✅ Готово к отправке');
+  });
+
+
+  SpreadsheetApp.getUi().alert(
+    'Заявки подготовлены.'
+  );
+}
+
+
+function testSlackMessage() {
+  // Получаем токен из Script Properties
+  const token = PropertiesService
+    .getScriptProperties()
+    .getProperty('SLACK_BOT_TOKEN');
+
+  if (!token) {
+    throw new Error('Не найден SLACK_BOT_TOKEN');
+  }
+
+  // УКАЖИ СВОЮ ПОЧТУ ИЗ SLACK
+  const email = 'alina.kukarina@salote.ch';
+
+  // 1. Ищем пользователя по email
+  const lookupResponse = UrlFetchApp.fetch(
+    'https://slack.com/api/users.lookupByEmail',
+    {
+      method: 'post',
+      headers: {
+        Authorization: 'Bearer ' + token
+      },
+      payload: { email: email },
+      muteHttpExceptions: true
+    }
+  );
+
+  const user = JSON.parse(lookupResponse.getContentText());
+
+  if (!user.ok) {
+    throw new Error('Ошибка поиска: ' + user.error);
+  }
+
+  // 2. Отправляем сообщение
+  const messageResponse = UrlFetchApp.fetch(
+    'https://slack.com/api/chat.postMessage',
+    {
+      method: 'post',
+      contentType: 'application/json',
+      headers: {
+        Authorization: 'Bearer ' + token
+      },
+      payload: JSON.stringify({
+        channel: user.user.id,
+        text: 'Привет! Это тестовое сообщение от Support-Airline-Account-Mailer.',
+        unfurl_links: false
+      }),
+      muteHttpExceptions: true
+    }
+  );
+
+  const result = JSON.parse(messageResponse.getContentText());
+
+  if (!result.ok) {
+    throw new Error('Ошибка отправки: ' + result.error);
+  }
+
+  Logger.log('Сообщение успешно отправлено!');
+}
+
+const MAILER = {
+  requests: 'ответы из вф',
+  config: 'Конфигурация'
+};
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Slack рассылка')
+    .addItem('Отправить выбранную заявку', 'sendSelectedRequest')
+    .addToUi();
+}
+
+function sendSelectedRequest() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+  const sheet = ss.getActiveSheet();
+
+  if (sheet.getName() !== MAILER.requests) {
+    ui.alert('Открой лист "ответы из вф"');
+    return;
+  }
+
+  const rowNumber = sheet.getActiveCell().getRow();
+
+  if (rowNumber < 2) {
+    ui.alert('Выбери строку с заявкой.');
+    return;
+  }
+
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(1000)) {
+    ui.alert('Другая рассылка уже выполняется.');
+    return;
+  }
+
+  try {
+    const headers = sheet
+      .getRange(1, 1, 1, sheet.getLastColumn())
+      .getValues()[0].map(String);
+
+    function col(name) {
+      const index = headers.indexOf(name);
+      if (index === -1) {
+        throw new Error('Не найдена колонка: ' + name);
+      }
+      return index + 1;
+    }
+
+    const airline = String(
+      sheet.getRange(rowNumber, col('Авиакомпания')).getValue()
+    ).trim();
+
+    const rawEmails = String(
+      sheet.getRange(rowNumber, col('Email')).getValue()
+    );
+
+    const statusCell = sheet.getRange(rowNumber, col('Статус'));
+    const countCell = sheet.getRange(rowNumber, col('Получателей'));
+
+    // Запрещаем повторную отправку завершённой заявки
+    const status = String(statusCell.getValue());
+
+    if (status.startsWith('Отправлено') ||
+        status.startsWith('Отправка') ||
+        status.startsWith('Частично отправлено')) {
+      ui.alert(
+        'Эта заявка уже отправлялась. Повторная отправка заблокирована.'
+      );
+      return;
+    }
+
+    const emails = [...new Set(
+      rawEmails
+        .split(/[\n,;]+/)
+        .map(e => e.trim().toLowerCase())
+        .filter(Boolean)
+    )];
+
+    if (!emails.length) {
+      throw new Error('В заявке нет email.');
+    }
+
+    // Проверяем формат всех email
+    const invalid = emails.filter(
+      e => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)
+    );
+
+    if (invalid.length) {
+      throw new Error('Некорректные email: ' + invalid.join(', '));
+    }
+
+    const configSheet = ss.getSheetByName(MAILER.config);
+    if (!configSheet) {
+      throw new Error('Не найден лист "Конфигурация"');
+    }
+
+    const config = configSheet.getDataRange().getValues();
+    const configHeaders = config[0].map(String);
+    const airlineIndex = configHeaders.indexOf('Авиакомпания');
+    const textIndex = configHeaders.indexOf('Текст сообщения');
+
+    if (airlineIndex < 0 || textIndex < 0) {
+      throw new Error('Проверь заголовки листа "Конфигурация"');
+    }
+
+    const matching = config.slice(1).filter(r =>
+      String(r[airlineIndex]).trim().toLowerCase() ===
+      airline.toLowerCase()
+    );
+
+    if (matching.length !== 1 || !String(matching[0][textIndex]).trim()) {
+      throw new Error(
+        'Для авиакомпании "' + airline +
+        '" нужен ровно один непустой шаблон.'
+      );
+    }
+
+    const message = String(matching[0][textIndex]);
+
+    const token = PropertiesService
+      .getScriptProperties()
+      .getProperty('SLACK_BOT_TOKEN');
+
+    if (!token) {
+      throw new Error('Не найден SLACK_BOT_TOKEN');
+    }
+
+    countCell.setValue(emails.length);
+
+    const answer = ui.alert(
+      'Подтвердить рассылку',
+      'Авиакомпания: ' + airline +
+      '\nПолучателей: ' + emails.length +
+      '\n\nТекст сообщения:\n' + message +
+      '\n\nОтправить всем?',
+      ui.ButtonSet.YES_NO
+    );
+
+    if (answer !== ui.Button.YES) return;
+
+    // Блокируем повторный запуск до начала отправки
+    statusCell.setValue('Отправка');
+    SpreadsheetApp.flush();
+
+    let sent = 0;
+    const errors = [];
+
+    // Журнал результатов по каждому email
+    const logSheetName = 'Лог отправок';
+    let logSheet = ss.getSheetByName(logSheetName);
+
+    if (!logSheet) {
+      logSheet = ss.insertSheet(logSheetName);
+      logSheet.appendRow([
+        'Время', 'Строка заявки', 'Авиакомпания',
+        'Email', 'Результат', 'Детали'
+      ]);
+    }
+
+    for (const email of emails) {
+      try {
+        const user = slackApi(
+          'users.lookupByEmail',
+          { email: email },
+          token
+        );
+
+        slackApi(
+          'chat.postMessage',
+          {
+            channel: user.user.id,
+            text: message,
+            unfurl_links: false
+          },
+          token
+        );
+
+        sent++;
+
+        logSheet.appendRow([
+          new Date(), rowNumber, airline, email,
+          'Отправлено', ''
+        ]);
+
+      } catch (error) {
+        errors.push(email + ': ' + error.message);
+
+        logSheet.appendRow([
+          new Date(), rowNumber, airline, email,
+          'Ошибка', error.message
+        ]);
+      }
+    }
+
+    if (sent === emails.length) {
+      statusCell.setValue('Отправлено: ' + sent + '/' + emails.length);
+    } else if (sent > 0) {
+      statusCell.setValue(
+        'Частично отправлено: ' + sent + '/' + emails.length
+      );
+    } else {
+      statusCell.setValue('Ошибка: 0/' + emails.length);
+    }
+
+    ui.alert(
+      'Рассылка завершена',
+      'Успешно: ' + sent +
+      '\nОшибок: ' + errors.length +
+      '\n\nПодробности — на листе "Лог отправок".',
+      ui.ButtonSet.OK
+    );
+
+  } catch (error) {
+    ui.alert('Ошибка: ' + error.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+function slackApi(method, payload, token) {
+  const isLookup = method === 'users.lookupByEmail';
+
+  const options = {
+    method: 'post',
+    headers: {
+      Authorization: 'Bearer ' + token
+    },
+    muteHttpExceptions: true
+  };
+
+  if (isLookup) {
+    // Для поиска пользователя передаём email как form data
+    options.payload = {
+      email: payload.email
+    };
+  } else {
+    // Для отправки сообщений используем JSON
+    options.contentType = 'application/json';
+    options.payload = JSON.stringify(payload);
+  }
+
+  const response = UrlFetchApp.fetch(
+    'https://slack.com/api/' + method,
+    options
+  );
+
+  const result = JSON.parse(response.getContentText());
+
+  if (!result.ok) {
+    throw new Error(method + ': ' + result.error);
+  }
+
+  return result;
+}
+
+
